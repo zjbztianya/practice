@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"hash/fnv"
 	"io/ioutil"
-	"os"
 	"log"
+	"os"
 )
 
 // doMap manages one map task: it reads one of the input files
