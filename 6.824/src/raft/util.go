@@ -1,6 +1,10 @@
 package raft
 
-import "log"
+import (
+	"log"
+	"math/rand"
+	"time"
+)
 
 // Debugging
 const Debug = 0
@@ -10,4 +14,13 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 		log.Printf(format, a...)
 	}
 	return
+}
+
+func AfterBetween(min, max time.Duration) <-chan time.Time {
+	rd := rand.New(rand.NewSource(time.Now().UnixNano()))
+	d, delta := min, max-min
+	if delta > 0 {
+		d += time.Duration(rd.Int63n(int64(delta)))
+	}
+	return time.After(d)
 }
