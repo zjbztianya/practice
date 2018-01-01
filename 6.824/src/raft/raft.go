@@ -82,7 +82,11 @@ type Raft struct {
 
 	state ServerStates
 
-	applyCh chan ApplyMsg
+	applyCh         chan ApplyMsg
+	voteCh          chan RequestVoteReply
+	appendEntriesCh chan RequestAppendEntriesReply
+	stopLeaderCh    chan bool
+	electionTimer   *time.Timer
 }
 
 //
@@ -101,8 +105,8 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
-	term = rf.currentTerm
-	if rf.state == Leader {
+	term = rf.GetTerm()
+	if rf.State() == Leader {
 		isleader = true
 	}
 	return term, isleader
@@ -167,8 +171,8 @@ type RequestVoteReply struct {
 type RequestAppendEntriesArgs struct {
 	Term         int
 	LeaderId     int
-	prevLogIndex int
-	prevLogTerm  int
+	PrevLogIndex int
+	PrevLogTerm  int
 	Entries      []LogEntry
 	LeaderCommit int
 }
@@ -186,6 +190,28 @@ type RequestAppendEntriesReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	currentTerm := rf.GetTerm()
+	reply.Term = currentTerm
+	reply.VoteGranted = false
+	if args.Term < currentTerm {
+		return
+	}
+
+	if args.Term > currentTerm {
+		rf.updateTerm(args.Term)
+	}
+
+	if rf.getVoteFor() != -1 {
+		return
+	}
+
+	lastLogTerm, lastLogIndex := rf.lastLogInfo()
+	if lastLogTerm <= args.LastLogTerm && lastLogIndex <= args.LastLogIndex {
+		reply.VoteGranted = true
+		reply.Term = args.Term
+		rf.setVoteFor(args.CandidateId)
+		return
+	}
 }
 
 //
@@ -219,19 +245,67 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	if rf.State() != Candidate {
+		return false
+	}
 	return ok
+}
+
+func (rf *Raft) processRequestVoteReply(reply *RequestVoteReply) bool {
+
+	currentTerm := rf.GetTerm()
+	if reply.VoteGranted && currentTerm == reply.Term {
+		return true
+	}
+	// Discover higher term: step down
+	if reply.Term > currentTerm {
+		rf.updateTerm(reply.Term)
+	}
+
+	return false
 }
 
 //
 //
 //
 func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
+	currentTerm := rf.GetTerm()
+	reply.Term = currentTerm
+	reply.Success = false
 
+	if args.Term > currentTerm {
+		state := rf.State()
+		rf.updateTerm(args.Term)
+		if state != Follower {
+			return
+		}
+	}
+
+	defer rf.resetElectionTimer()
+	if args.Term < currentTerm {
+		return
+	}
+
+	reply.Success = true
 }
 
-func (rf *Raft) sendRequestAppendEntries(server int, args *RequestVoteArgs, reply *RequestAppendEntriesReply) bool {
+func (rf *Raft) sendRequestAppendEntries(server int, args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestAppendEntries", args, reply)
+	if rf.State() != Leader {
+		return false
+	}
 	return ok
+}
+
+func (rf *Raft) processRequestAppendEntriesReply(reply *RequestAppendEntriesReply) {
+
+	if reply.Term > rf.GetTerm() {
+		rf.updateTerm(reply.Term)
+	}
+
+	if !reply.Success {
+		return
+	}
 }
 
 //
@@ -276,64 +350,180 @@ func (rf *Raft) State() ServerStates {
 func (rf *Raft) setState(s ServerStates) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	preState := rf.state
 	rf.state = s
+	if preState == Leader {
+		go func() { rf.stopLeaderCh <- true }()
+	}
 }
 
 func (rf *Raft) lastLogInfo() (int, int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	lastLog := rf.log[len(rf.log)-1]
 	return lastLog.Term, lastLog.Index
 }
 
+func (rf *Raft) majority(votes int) bool {
+	return votes > (len(rf.peers) / 2)
+}
+
+func (rf *Raft) updateTerm(term int) {
+	rf.mu.Lock()
+	rf.currentTerm = term
+	rf.votedFor = -1
+	rf.mu.Unlock()
+	if rf.State() != Follower {
+		rf.setState(Follower)
+	}
+}
+
+func (rf *Raft) GetTerm() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.currentTerm
+}
+
+func (rf *Raft) incTerm() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.currentTerm++
+}
+
+func (rf *Raft) getVoteFor() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.votedFor
+}
+
+func (rf *Raft) setVoteFor(v int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.votedFor = v
+
+}
+
+func (rf *Raft) startElectionTimer() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.electionTimer = time.NewTimer(AfterBetween(ElectionTimeout, 2*ElectionTimeout))
+}
+
+func (rf *Raft) stopElectionTimer() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.electionTimer.Stop()
+}
+
+func (rf *Raft) resetElectionTimer() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.electionTimer.Reset(AfterBetween(ElectionTimeout, 2*ElectionTimeout))
+}
+
+func (rf *Raft) getElectionTimeOutChan() <-chan time.Time {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.electionTimer.C
+}
+
+func (rf *Raft) starHeartbeat() {
+	for i := range rf.peers {
+		if i != rf.me {
+			go func(server int) {
+				ticker := time.NewTicker(HeartbeatTimeout)
+				for rf.State() == Leader {
+					prevLogIndex := rf.nextIndex[server] - 1
+					args := RequestAppendEntriesArgs{
+						Term:         rf.GetTerm(),
+						LeaderId:     rf.me,
+						LeaderCommit: rf.commitIndex,
+						PrevLogIndex: prevLogIndex,
+						PrevLogTerm:  rf.log[prevLogIndex].Term,
+					}
+					go func() {
+						var reply RequestAppendEntriesReply
+						if rf.sendRequestAppendEntries(server, &args, &reply) {
+							rf.appendEntriesCh <- reply
+						}
+					}()
+					<-ticker.C
+				}
+				ticker.Stop()
+			}(i)
+		}
+	}
+}
+
 func (rf *Raft) leaderLoop() {
+	for i := range rf.peers {
+		rf.nextIndex[i] = len(rf.log)
+		rf.matchIndex[i] = 0
+	}
 
-	for rf.State() == Leader {
-
+	rf.appendEntriesCh = make(chan RequestAppendEntriesReply, len(rf.peers))
+	rf.starHeartbeat()
+	for {
+		select {
+		case <-rf.stopLeaderCh:
+			return
+		case reply := <-rf.appendEntriesCh:
+			rf.processRequestAppendEntriesReply(&reply)
+		}
 	}
 }
 
 func (rf *Raft) followerLoop() {
-
-	for rf.State() == Follower {
-
+	rf.startElectionTimer()
+	select {
+	case <-rf.electionTimer.C:
+		rf.setState(Candidate)
+		rf.stopElectionTimer()
+		return
 	}
 }
 
 func (rf *Raft) candidateLoop() {
 	doVote := true
 	votesGranted := 0
-	var timeoutChan <-chan time.Time
 	lastLogIndex, lastLogTerm := rf.lastLogInfo()
-	replyChan := make(chan RequestVoteReply, len(rf.peers))
-	for rf.State() == Candidate {
+	rf.voteCh = make(chan RequestVoteReply, len(rf.peers))
+	rf.startElectionTimer()
+	for {
 		if doVote {
-			rf.currentTerm++
-			rf.votedFor = rf.me
+			rf.incTerm()
+			rf.setVoteFor(rf.me)
 			for i := range rf.peers {
-				go func() {
+				go func(server int) {
 					args := RequestVoteArgs{
-						Term:         rf.currentTerm,
+						Term:         rf.GetTerm(),
 						CandidateId:  rf.me,
 						LastLogTerm:  lastLogTerm,
 						LastLogIndex: lastLogIndex,
 					}
 					var reply RequestVoteReply
-					if rf.sendRequestVote(i, &args, &reply) {
-						replyChan <- reply
+					if rf.sendRequestVote(server, &args, &reply) {
+						rf.voteCh <- reply
 					}
-				}()
+				}(i)
 			}
-			votesGranted++
+			votesGranted = 1
 			doVote = false
-			timeoutChan=AfterBetween(ElectionTimeout, 2*ElectionTimeout)
 		}
 
 		select {
-		case reply:=<-replyChan:
-			if reply.VoteGranted {
-
+		case reply := <-rf.voteCh:
+			if rf.processRequestVoteReply(&reply) {
+				votesGranted++
+				if rf.majority(votesGranted) {
+					rf.setState(Leader)
+					rf.stopElectionTimer()
+					return
+				}
 			}
-		case <-timeoutChan:
+		case <-rf.getElectionTimeOutChan():
 			doVote = true
+			rf.resetElectionTimer()
 		}
 	}
 }
@@ -371,19 +561,22 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.currentTerm = 0
-	rf.votedFor = 0
+	rf.votedFor = -1
 	rf.log = []LogEntry{}
-
+	rf.log = append(rf.log, LogEntry{0, 0, nil})
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
 
-	rf.setState(Follower)
 	rf.applyCh = applyCh
+	rf.stopLeaderCh = make(chan bool)
+	rf.setState(Follower)
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-	rf.mainLoop()
+	go func() {
+		rf.mainLoop()
+	}()
 	return rf
 }

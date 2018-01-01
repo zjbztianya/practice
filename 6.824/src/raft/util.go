@@ -7,7 +7,7 @@ import (
 )
 
 // Debugging
-const Debug = 0
+const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -16,11 +16,11 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-func AfterBetween(min, max time.Duration) <-chan time.Time {
+func AfterBetween(min, max time.Duration) time.Duration {
 	rd := rand.New(rand.NewSource(time.Now().UnixNano()))
 	d, delta := min, max-min
 	if delta > 0 {
 		d += time.Duration(rd.Int63n(int64(delta)))
 	}
-	return time.After(d)
+	return d
 }
