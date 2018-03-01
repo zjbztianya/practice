@@ -99,7 +99,6 @@ type LogEntry struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
 	var term int
 	var isLeader bool
 	// Your code here (2A).
@@ -323,7 +322,6 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 	}
 
 	reply.Success = true
-
 	rf.log = rf.log[:args.PrevLogIndex+1]
 	if len(args.Entries) > 0 {
 		rf.log = append(rf.log, args.Entries...)
@@ -369,6 +367,7 @@ func (rf *Raft) sendRequestAppendEntries(server int, args *RequestAppendEntriesA
 			for i := 0; i < rf.nextIndex[server]; i++ {
 				if reply.conflictTerm == rf.log[i].Term {
 					nextIndex = i
+					break
 				}
 			}
 			rf.nextIndex[server] = nextIndex
@@ -472,8 +471,6 @@ func (rf *Raft) GetTerm() int {
 }
 
 func (rf *Raft) startElectionTimer() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	rf.electionTimer = time.NewTimer(AfterBetween(ElectionTimeout, 2*ElectionTimeout))
 }
 
@@ -507,8 +504,12 @@ func (rf *Raft) starHeartbeat() {
 			go func(server int) {
 				ticker := time.NewTicker(HeartbeatTimeout)
 				defer ticker.Stop()
-				for rf.State() == Leader {
+				for {
 					rf.mu.Lock()
+					if rf.state != Leader {
+						rf.mu.Unlock()
+						return
+					}
 					nextIndex := rf.nextIndex[server]
 					args := RequestAppendEntriesArgs{
 						Term:         rf.currentTerm,
@@ -544,7 +545,7 @@ func (rf *Raft) leaderLoop() {
 }
 
 func (rf *Raft) followerLoop() {
-	rf.startElectionTimer()
+	rf.resetElectionTimer()
 	defer rf.stopElectionTimer()
 	for {
 		select {
@@ -563,7 +564,7 @@ func (rf *Raft) candidateLoop() {
 	votesGranted := 0
 	lastLogTerm, lastLogIndex := rf.lastLogInfo()
 	var voteCh chan *RequestVoteReply
-	rf.startElectionTimer()
+	rf.resetElectionTimer()
 	defer rf.stopElectionTimer()
 	defer func() {
 		rf.mu.Lock()
@@ -666,8 +667,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = Follower
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-	go func() {
-		rf.mainLoop()
-	}()
+	rf.startElectionTimer()
+	go rf.mainLoop()
+
 	return rf
 }
